@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, typecheck, unit tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+        env:
+          # Public values only. The build must succeed with placeholder
+          # configuration so a fork without secrets still verifies.
+          NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder-anon-key-for-build-only
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+  database:
+    name: Migrations and RLS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start Supabase
+        run: supabase start
+
+      - name: Apply migrations and seed
+        run: supabase db reset
+
+      - name: Schema and policy checks
+        run: node scripts/db-smoke.mjs
+
+      - name: Stop Supabase
+        if: always()
+        run: supabase stop --no-backup
+
+  secret-scan:
+    name: No privileged key in client code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if a service-role key is referenced outside server modules
+        run: |
+          set -e
+          # The service-role key may only appear in the admin client, the email
+          # provider and environment files — never in a component or page.
+          offenders=$(grep -rIl --include='*.ts' --include='*.tsx' \
+            -e 'SUPABASE_SERVICE_ROLE_KEY' -e 'service_role' \
+            src/components src/app 2>/dev/null | grep -v 'src/app/api/' || true)
+          if [ -n "$offenders" ]; then
+            echo "Service-role credentials referenced in client-facing code:"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "No service-role references in client-facing code."
+
+      - name: Fail if a real key pattern is committed
+        run: |
+          set -e
+          if grep -rIn --exclude-dir=node_modules --exclude='*.md' \
+             -E 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]{20,}' . ; then
+            echo "A JWT-shaped secret appears to be committed."
+            exit 1
+          fi
+          echo "No committed JWTs found."
